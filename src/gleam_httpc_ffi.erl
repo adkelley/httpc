@@ -1,5 +1,22 @@
 -module(gleam_httpc_ffi).
--export([default_user_agent/0, normalise_error/1]).
+-export([default_user_agent/0, normalise_error/1, receive_next_stream_message/1, coerce_stream_message/1]).
+
+%%====================================================================
+%% Streaming
+%%====================================================================
+ %% Helper: call stream_next with whatever the handler expects
+receive_next_stream_message(HandlerPid) when is_pid(HandlerPid) ->
+ httpc:stream_next(HandlerPid),
+nil.
+
+coerce_stream_message({http, {ReqId, stream_start, Headers, Pid}}) -> {raw_stream_start, ReqId, Headers, Pid};
+coerce_stream_message({http, {ReqId, stream, BinBodyPart}}) -> {raw_stream_chunk, ReqId, BinBodyPart};
+coerce_stream_message({http, {ReqId, stream_end, Headers}}) -> {raw_stream_end, ReqId, Headers};
+coerce_stream_message({http, {ReqId, {error, Reason}}}) -> {raw_stream_error, ReqId, normalise_error(Reason)}. 
+  
+%%====================================================================
+%% Error normalization
+%%====================================================================
 
 normalise_error(Error = {failed_connect, Opts}) ->
     Ipv6 = case lists:keyfind(inet6, 1, Opts) of
