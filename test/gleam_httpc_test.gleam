@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/http.{Get, Head, Options}
 import gleam/http/request
 import gleam/http/response
@@ -160,4 +161,29 @@ pub fn timeout_error_test() {
     |> httpc.timeout(200)
     |> httpc.dispatch(req)
     == Error(httpc.ResponseTimeout)
+}
+
+pub fn async_stream_self_once_test() {
+  let req =
+    request.new()
+    |> request.set_method(Get)
+    |> request.set_host("postman-echo.com")
+    |> request.set_path("/stream/1")
+
+  let assert Ok(request_id) = httpc.async_send(req)
+  let selector = httpc.initialize_stream_selector()
+
+  let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
+
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
+
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
 }

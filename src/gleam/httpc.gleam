@@ -1,6 +1,10 @@
 import gleam/bit_array
+
 import gleam/dynamic.{type Dynamic}
+import gleam/erlang/atom
 import gleam/erlang/charlist.{type Charlist}
+import gleam/erlang/process
+import gleam/erlang/reference.{type Reference}
 import gleam/http.{type Method}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response, Response}
@@ -38,9 +42,19 @@ type BodyFormat {
   Binary
 }
 
+type Destination {
+  Self
+}
+
+type Mode {
+  Once
+}
+
 type ErlOption {
   BodyFormat(BodyFormat)
   SocketOpts(List(SocketOpt))
+  Sync(Bool)
+  Stream(#(Destination, Mode))
 }
 
 type SocketOpt {
@@ -57,6 +71,21 @@ type ErlSslOption {
 
 type ErlVerifyOption {
   VerifyNone
+}
+
+pub type HttpSocket
+
+type Headers =
+  List(#(String, String))
+
+type RequestId =
+  Reference
+
+pub type StreamMessage {
+  StreamStart(RequestId, Headers, process.Pid)
+  StreamChunk(RequestId, BitArray)
+  StreamEnd(RequestId, Headers)
+  StreamError(RequestId, HttpError)
 }
 
 @external(erlang, "httpc", "request")
@@ -81,6 +110,22 @@ fn erl_request_no_body(
   Dynamic,
 )
 
+@external(erlang, "httpc", "request")
+fn erl_request_async_no_body(
+  a: Method,
+  b: #(Charlist, List(#(Charlist, Charlist))),
+  c: List(ErlHttpOption),
+  d: List(ErlOption),
+) -> Result(Reference, Dynamic)
+
+@external(erlang, "httpc", "request")
+fn erl_request_async(
+  a: Method,
+  b: #(Charlist, List(#(Charlist, Charlist)), Charlist, BitArray),
+  c: List(ErlHttpOption),
+  d: List(ErlOption),
+) -> Result(Reference, Dynamic)
+
 fn string_header(header: #(Charlist, Charlist)) -> #(String, String) {
   let #(k, v) = header
   #(charlist.to_string(k), charlist.to_string(v))
@@ -96,6 +141,103 @@ pub fn send_bits(
 ) -> Result(Response(BitArray), HttpError) {
   configure()
   |> dispatch_bits(req)
+}
+
+/// Send an asynchronous HTTP request of binary data using the default configuration.
+///
+/// If you wish to use some other configuration use `async_dispatch_bits` instead.
+///
+pub fn async_send_bits(req: Request(BitArray)) -> Result(Reference, HttpError) {
+  configure()
+  |> async_dispatch_bits(req)
+}
+
+/// Send an asynchronous HTTP request of binary data
+/// 
+pub fn async_dispatch_bits(
+  config: Configuration,
+  req: Request(BitArray),
+) -> Result(Reference, HttpError) {
+  let erl_url =
+    req
+    |> request.to_uri
+    |> uri.to_string
+    |> charlist.from_string
+  let erl_headers = prepare_headers(req.headers)
+  let erl_http_options = [
+    Autoredirect(config.follow_redirects),
+    Timeout(config.timeout),
+  ]
+  let erl_http_options = case config.verify_tls {
+    True -> erl_http_options
+    False -> [Ssl([Verify(VerifyNone)]), ..erl_http_options]
+  }
+  let erl_options = [
+    BodyFormat(Binary),
+    SocketOpts([Ipfamily(Inet6fb4)]),
+    Sync(False),
+    Stream(#(Self, Once)),
+  ]
+  use request_id <- result.try(
+    case req.method {
+      http.Options | http.Head | http.Get -> {
+        let erl_req = #(erl_url, erl_headers)
+        erl_request_async_no_body(
+          req.method,
+          erl_req,
+          erl_http_options,
+          erl_options,
+        )
+      }
+      _ -> {
+        let erl_content_type =
+          req
+          |> request.get_header("content-type")
+          |> result.unwrap("application/octet-stream")
+          |> charlist.from_string
+        let erl_req = #(erl_url, erl_headers, erl_content_type, req.body)
+        erl_request_async(req.method, erl_req, erl_http_options, erl_options)
+      }
+    }
+    |> result.map_error(normalise_error),
+  )
+
+  Ok(request_id)
+}
+
+@external(erlang, "gleam_httpc_ffi", "stream_next")
+pub fn stream_next(pid: process.Pid) -> Result(Nil, Nil)
+
+@external(erlang, "gleam_httpc_ffi", "coerce_stream_message")
+fn unsafe_decode(msg: Dynamic) -> StreamMessage
+
+fn map_stream_message(mapper: fn(StreamMessage) -> t) -> fn(Dynamic) -> t {
+  fn(message) { mapper(unsafe_decode(message)) }
+}
+
+fn select_stream_messages(
+  selector: process.Selector(t),
+  mapper: fn(StreamMessage) -> t,
+) -> process.Selector(t) {
+  let http = atom.create("http")
+
+  selector
+  |> process.select_record(http, 1, map_stream_message(mapper))
+}
+
+/// Initialize asychronous streaming by confiquring a selector to receive stream messages.
+///
+/// Note this will receive messages from all processes that sent an asychronous
+/// HTTP request; for example using `async_send`, rather than any specific one.
+/// In this case, for finer grained processing, you can filter on the request_id,
+/// which is the first argument in the `StreamMessage` constructor.
+/// If you wish to only handle stream messages from one process, then use one
+/// process per asychronous HTTP request. 
+///
+pub fn initialize_stream_selector() -> process.Selector(StreamMessage) {
+  let handle = fn(msg: StreamMessage) { msg }
+  process.new_selector()
+  |> select_stream_messages(handle)
 }
 
 // TODO: refine error type
@@ -141,6 +283,7 @@ pub fn dispatch_bits(
   )
 
   let #(#(_version, status, _status), headers, resp_body) = response
+
   Ok(Response(status, list.map(headers, string_header), resp_body))
 }
 
@@ -177,7 +320,6 @@ pub opaque type Configuration {
 /// - Redirects are not followed.
 /// - The timeout for the response to be received is 30 seconds from when the
 ///   request is sent.
-///
 pub fn configure() -> Configuration {
   Builder(verify_tls: True, follow_redirects: False, timeout: 30_000)
 }
@@ -209,7 +351,7 @@ pub fn timeout(config: Configuration, timeout: Int) -> Configuration {
   Builder(..config, timeout:)
 }
 
-/// Send a HTTP request of unicode data.
+/// Send a synchronus HTTP request of unicode data.
 ///
 pub fn dispatch(
   config: Configuration,
@@ -224,7 +366,26 @@ pub fn dispatch(
   }
 }
 
-// TODO: refine error type
+/// Send a asynchronus HTTP request of unicode data.
+///
+pub fn async_dispatch(
+  config: Configuration,
+  request: Request(String),
+) -> Result(Reference, HttpError) {
+  let request = request.map(request, bit_array.from_string)
+  use request_id <- result.try(async_dispatch_bits(config, request))
+  Ok(request_id)
+}
+
+/// Send a HTTP asychronous request of unicode data using the default configuration.
+///
+/// If you wish to use some other configuration use `async_dispatch` instead.
+///
+pub fn async_send(req: Request(String)) -> Result(Reference, HttpError) {
+  configure()
+  |> async_dispatch(req)
+}
+
 /// Send a HTTP request of unicode data using the default configuration.
 ///
 /// If you wish to use some other configuration use `dispatch` instead.
