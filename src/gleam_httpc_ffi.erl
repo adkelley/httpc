@@ -1,23 +1,6 @@
 -module(gleam_httpc_ffi).
--export([default_user_agent/0, normalise_error/1, stream_next/1, 'receive'/2]).
-%% -export([default_user_agent/0, normalise_error/1, stream_next/1, 'receive'/2, stream_to_file/0]).
+-export([default_user_agent/0, normalise_error/1, stream_next/1, receive_stream_start/2, receive_stream_chunk/2, receive_stream_end/2]).
 
-%% stream_to_file() ->
-%%     Url = "https://postman-echo.com/stream/5",
-%%     Filename = tmpfile("httpc_stream_test"),
-%%     %% Asynchronous request; body streamed to file by httpc
-%%     {ok, ReqId} =
-%%         httpc:request(
-%%           get,
-%%           {Url, []},
-%%           [],  %% HTTP options
-%%           [{sync, false}, {stream, Filename}]  %% client options
-%%         ).
-
-%% tmpfile(Prefix) ->
-%%     Dir = case os:getenv("TMPDIR") of false -> "/tmp"; D -> D end,
-%%     Name = io_lib:format("~s~p.bin", [Prefix, erlang:unique_integer([monotonic, positive])]),
-%%     filename:join(Dir, lists:flatten(Name)).
 %%====================================================================
 %% Streaming
 %%====================================================================
@@ -28,14 +11,25 @@ stream_next(HandlerPid) when is_pid(HandlerPid) ->
    _  -> {error, nil}
  end.
 
-'receive'(ReqId, Timeout) ->
+receive_stream_start(ReqId, Timeout) ->
    receive
-     {http, {ReqId, stream_start, Headers}} -> {ok, {stream_start, Headers}};
-     {http, {ReqId, stream_start, Headers, Pid}} -> {ok, {stream_start, {Headers, Pid}}};
-     {http, {ReqId, stream, Chunk}} -> {ok, {stream, Chunk}};
-     {http, {ReqId, stream_end, EndInfo}} -> {ok, {stream_end, EndInfo}};
-     {http, {ReqId, saved_to_file}} -> {ok, {saved_to_file, nil}};
-     {http, {ReqId, {{Version, Status, Reason}, Headers, Body}}} -> {ok, {stream_none, {{Version, Status, Reason}, Headers, Body}}};
+     {http, {ReqId, stream_start, Headers, Pid}} -> {ok, {Headers, Pid}};
+     {http, {ReqId, {error, Reason}}} -> {error, Reason}
+   after Timeout ->
+     {error, timeout}
+   end.
+
+receive_stream_chunk(ReqId, Timeout) ->
+   receive
+     {http, {ReqId, stream, BinBodyPart}} -> {ok, BinBodyPart};
+     {http, {ReqId, {error, Reason}}} -> {error, Reason}
+   after Timeout ->
+     {error, timeout}
+   end.
+
+receive_stream_end(ReqId, Timeout) ->
+   receive
+     {http, {ReqId, stream_end, Headers}} -> {ok, Headers};
      {http, {ReqId, {error, Reason}}} -> {error, Reason}
    after Timeout ->
      {error, timeout}

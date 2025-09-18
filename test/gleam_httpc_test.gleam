@@ -1,9 +1,7 @@
-import gleam/erlang/atom
 import gleam/http.{Get, Head, Options}
 import gleam/http/request
 import gleam/http/response
 import gleam/httpc
-import gleam/io
 import gleam/string
 import gleeunit
 
@@ -164,39 +162,6 @@ pub fn timeout_error_test() {
     == Error(httpc.ResponseTimeout)
 }
 
-pub fn async_stream_self_test() {
-  let req =
-    request.new()
-    |> request.set_method(Get)
-    |> request.set_host("postman-echo.com")
-    |> request.set_path("/stream/1")
-
-  let config =
-    httpc.configure()
-    |> httpc.async_stream(httpc.StreamSelf)
-
-  let assert Ok(request_id) = httpc.async_dispatch(config, req)
-
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-
-  // stream_start
-  // #(stream_start, headers) 
-  let #(stream_start, _headers) = response
-  assert atom.to_string(stream_start) == "stream_start"
-
-  // stream - 1 chunk
-  // #(stream, chunk) 
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-  let #(stream, _chunk) = response
-  assert atom.to_string(stream) == "stream"
-
-  // stream_end
-  // #(stream, end_info) 
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-  let #(stream_end, _end_info) = response
-  assert atom.to_string(stream_end) == "stream_end"
-}
-
 pub fn async_stream_self_once_test() {
   let req =
     request.new()
@@ -204,66 +169,17 @@ pub fn async_stream_self_once_test() {
     |> request.set_host("postman-echo.com")
     |> request.set_path("/stream/1")
 
-  let config =
-    httpc.configure()
-    |> httpc.async_stream(httpc.StreamSelfOnce)
-
-  let assert Ok(request_id) = httpc.async_dispatch(config, req)
+  let assert Ok(request_id) = httpc.async_send(req)
 
   // stream_start
-  // #(stream_start, headers, pid) 
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-  let #(stream_start, headers_pid) = response
-  assert atom.to_string(stream_start) == "stream_start"
-  let #(_headers, pid) = httpc.dynamic_to_headers_pid(headers_pid)
+  let assert Ok(response) = httpc.receive_stream_start(request_id, 10_000)
+  let #(_headers, pid) = response
 
   // stream - 1 chunks
-  // #(stream_start, chunk) 
-  let assert Ok(_) = httpc.async_stream_next(pid)
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-  let #(stream, _chunk) = response
-  assert atom.to_string(stream) == "stream"
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(_chunk) = httpc.receive_stream_chunk(request_id, 10_000)
 
   // stream_end
-  // #(stream_start, end_info) 
-  let assert Ok(_) = httpc.async_stream_next(pid)
-  let assert Ok(response) = httpc.async_receive(request_id, 10_000)
-  let #(stream_end, _end_info) = response
-  assert atom.to_string(stream_end) == "stream_end"
-}
-
-pub fn async_stream_file_test() {
-  let req =
-    request.new()
-    |> request.set_method(Get)
-    |> request.set_host("postman-echo.com")
-    |> request.set_path("/stream/5")
-
-  let config =
-    httpc.configure()
-    |> httpc.async_stream(httpc.StreamFile("/tmp/http_stream_test.json"))
-
-  let assert Ok(request_id) = httpc.async_dispatch(config, req)
-
-  let assert Ok(response) = httpc.async_receive(request_id, 1000)
-  let #(saved_to_file, _) = response
-  assert atom.to_string(saved_to_file) == "saved_to_file"
-}
-
-pub fn async_stream_none_test() {
-  let req =
-    request.new()
-    |> request.set_method(Get)
-    |> request.set_host("postman-echo.com")
-    |> request.set_path("/stream/5")
-
-  let config =
-    httpc.configure()
-    |> httpc.async_stream(httpc.StreamNone)
-
-  let assert Ok(request_id) = httpc.async_dispatch(config, req)
-
-  let assert Ok(response) = httpc.async_receive(request_id, 1000)
-  let #(stream_none, _rest) = response
-  assert atom.to_string(stream_none) == "stream_none"
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(_headers) = httpc.receive_stream_end(request_id, 10_000)
 }
