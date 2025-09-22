@@ -43,41 +43,31 @@ pub fn send_request() {
 ## Asynchronous (i.e., Streaming) requests
 
 ```gleam
-import gleam/erlang/atom
 import gleam/http.{Get}
 import gleam/http/request
 import gleam/httpc
 
-pub fn send_async_request() {
+pub fn async_stream_self_once() {
   let req =
     request.new()
     |> request.set_method(Get)
     |> request.set_host("postman-echo.com")
     |> request.set_path("/stream/1")
 
-  let config =
-    httpc.configure()
-    |> httpc.async_stream(httpc.StreamSelf)
+  let assert Ok(request_id) = httpc.async_send(req)
+  let selector = httpc.initialize_stream_selector()
 
-  let assert Ok(request_id) = httpc.async_dispatch(config, req)
+  let assert Ok(httpc.StreamStart(_request_id_, _headers, pid)) =
+    process.selector_receive(selector, 1000)
 
-  let assert Ok(payload) = httpc.async_receive(request_id, 1000)
-  // stream_start
-  // #(stream_start, headers) 
-  let #(stream_start, _headers) = payload
-  assert atom.to_string(stream_start) == "stream_start"
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
+    process.selector_receive(selector, 1000)
 
-  // stream - 1 chunk
-  // #(stream, chunk) 
-  let assert Ok(payload) = httpc.async_receive(request_id, 1000)
-  let #(stream, _chunk) = payload
-  assert atom.to_string(stream) == "stream"
-
-  // stream_end
-  // #(stream, end_info) 
-  let assert Ok(payload) = httpc.async_receive(request_id, 1000)
-  let #(stream_end, _end_info) = payload
-  assert atom.to_string(stream_end) == "stream_end"
+  let assert Ok(Nil) = httpc.stream_next(pid)
+  let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
+    process.selector_receive(selector, 1000)
+}
 }
 ```
 

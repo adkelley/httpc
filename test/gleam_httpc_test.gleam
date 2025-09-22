@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/http.{Get, Head, Options}
 import gleam/http/request
 import gleam/http/response
@@ -170,16 +171,19 @@ pub fn async_stream_self_once_test() {
     |> request.set_path("/stream/1")
 
   let assert Ok(request_id) = httpc.async_send(req)
+  let selector = httpc.initialize_stream_selector()
 
-  // stream_start
-  let assert Ok(response) = httpc.receive_stream_start(request_id, 10_000)
-  let #(_headers, pid) = response
+  let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
 
-  // stream - 1 chunks
   let assert Ok(Nil) = httpc.stream_next(pid)
-  let assert Ok(_chunk) = httpc.receive_stream_chunk(request_id, 10_000)
+  let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
 
-  // stream_end
   let assert Ok(Nil) = httpc.stream_next(pid)
-  let assert Ok(_headers) = httpc.receive_stream_end(request_id, 10_000)
+  let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
 }

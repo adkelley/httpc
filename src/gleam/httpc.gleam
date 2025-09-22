@@ -1,8 +1,9 @@
 import gleam/bit_array
+
 import gleam/dynamic.{type Dynamic}
-import gleam/erlang/atom.{type Atom}
+import gleam/erlang/atom
 import gleam/erlang/charlist.{type Charlist}
-import gleam/erlang/process.{type Pid}
+import gleam/erlang/process
 import gleam/erlang/reference.{type Reference}
 import gleam/http.{type Method}
 import gleam/http/request.{type Request}
@@ -41,12 +42,19 @@ type BodyFormat {
   Binary
 }
 
+type Destination {
+  Self
+}
+
+type Mode {
+  Once
+}
+
 type ErlOption {
   BodyFormat(BodyFormat)
   SocketOpts(List(SocketOpt))
   Sync(Bool)
-  // {self, once}
-  Stream(#(Atom, Atom))
+  Stream(#(Destination, Mode))
 }
 
 type SocketOpt {
@@ -63,6 +71,21 @@ type ErlSslOption {
 
 type ErlVerifyOption {
   VerifyNone
+}
+
+pub type HttpSocket
+
+type Headers =
+  List(#(String, String))
+
+type RequestId =
+  Reference
+
+pub type StreamMessage {
+  StreamStart(RequestId, Headers, process.Pid)
+  StreamChunk(RequestId, BitArray)
+  StreamEnd(RequestId, Headers)
+  StreamError(RequestId, HttpError)
 }
 
 @external(erlang, "httpc", "request")
@@ -120,7 +143,6 @@ pub fn send_bits(
   |> dispatch_bits(req)
 }
 
-// TODO: refine error type
 /// Send an asynchronous HTTP request of binary data using the default configuration.
 ///
 /// If you wish to use some other configuration use `async_dispatch_bits` instead.
@@ -130,8 +152,8 @@ pub fn async_send_bits(req: Request(BitArray)) -> Result(Reference, HttpError) {
   |> async_dispatch_bits(req)
 }
 
-// TODO: refine error type
 /// Send an asynchronous HTTP request of binary data
+/// 
 pub fn async_dispatch_bits(
   config: Configuration,
   req: Request(BitArray),
@@ -154,7 +176,7 @@ pub fn async_dispatch_bits(
     BodyFormat(Binary),
     SocketOpts([Ipfamily(Inet6fb4)]),
     Sync(False),
-    Stream(#(atom.create("self"), atom.create("once"))),
+    Stream(#(Self, Once)),
   ]
   use request_id <- result.try(
     case req.method {
@@ -183,69 +205,41 @@ pub fn async_dispatch_bits(
   Ok(request_id)
 }
 
-@external(erlang, "gleam_httpc_ffi", "receive_stream_start")
-fn stream_start(
-  req_id: Reference,
-  timeout: Int,
-) -> Result(#(List(#(Charlist, Charlist)), Pid), Dynamic)
-
-@external(erlang, "gleam_httpc_ffi", "receive_stream_chunk")
-fn stream_chunk(req_id: Reference, timeout: Int) -> Result(BitArray, Dynamic)
-
-@external(erlang, "gleam_httpc_ffi", "receive_stream_end")
-fn stream_end(
-  req_id: Reference,
-  timeout: Int,
-) -> Result(List(#(Charlist, Charlist)), Dynamic)
-
 /// Triggers the next asynchronous streaming message to be sent to the calling process
 /// designated by `pid`. 
 @external(erlang, "gleam_httpc_ffi", "stream_next")
-pub fn stream_next(pid: Pid) -> Result(Nil, Nil)
+pub fn stream_next(pid: process.Pid) -> Result(Nil, Nil)
 
-/// Receive an ansynchronous `stream_start` message to the process designated
-/// by the `request_id`.  The function returns the headers, and a process id
-/// 
-/// This process id is used as an argument to `httpc.stream_next(pid)` to trigger
-/// the next message to be sent to the calling process
-pub fn receive_stream_start(
-  req_id: Reference,
-  timeout: Int,
-) -> Result(#(List(#(Charlist, Charlist)), Pid), HttpError) {
-  use response <- result.try(
-    stream_start(req_id, timeout)
-    |> result.map_error(normalise_error),
-  )
-  Ok(response)
+@external(erlang, "gleam_httpc_ffi", "coerce_stream_message")
+fn unsafe_decode(msg: Dynamic) -> StreamMessage
+
+fn map_stream_message(mapper: fn(StreamMessage) -> t) -> fn(Dynamic) -> t {
+  fn(message) { mapper(unsafe_decode(message)) }
 }
 
-/// Receive an ansynchronous `stream` body part message to the process designated
-/// by the `request_id`.
-pub fn receive_stream_chunk(
-  req_id: Reference,
-  timeout: Int,
-) -> Result(BitArray, HttpError) {
-  use response <- result.try(
-    stream_chunk(req_id, timeout)
-    |> result.map_error(normalise_error),
-  )
-  Ok(response)
+fn select_stream_messages(
+  selector: process.Selector(t),
+  mapper: fn(StreamMessage) -> t,
+) -> process.Selector(t) {
+  let http = atom.create("http")
+
+  selector
+  |> process.select_record(http, 1, map_stream_message(mapper))
 }
 
-/// Receive an ansynchronous `stream_end` message to the process designated
-/// by the `request_id`.
+/// Initialize asychronous streaming by confiquring a selector to receive stream messages.
 ///
-/// Notice that chunked encoding can add headers so that there are more headers
-/// in the `stream_end` message than in `stream_start`.
-pub fn receive_stream_end(
-  req_id: Reference,
-  timeout: Int,
-) -> Result(List(#(Charlist, Charlist)), HttpError) {
-  use response <- result.try(
-    stream_end(req_id, timeout)
-    |> result.map_error(normalise_error),
-  )
-  Ok(response)
+/// Note this will receive messages from all processes that sent an asychronous
+/// HTTP request; for example using `async_send`, rather than any specific one.
+/// In this case, for finer grained processing, you can filter on the request_id,
+/// which is the first argument in the `StreamMessage` constructor.
+/// If you wish to only handle stream messages from one process, then use one
+/// process per asychronous HTTP request. 
+///
+pub fn initialize_stream_selector() -> process.Selector(StreamMessage) {
+  let handle = fn(msg: StreamMessage) { msg }
+  process.new_selector()
+  |> select_stream_messages(handle)
 }
 
 // TODO: refine error type
@@ -385,7 +379,6 @@ pub fn async_dispatch(
   Ok(request_id)
 }
 
-// TODO: refine error type
 /// Send a HTTP asychronous request of unicode data using the default configuration.
 ///
 /// If you wish to use some other configuration use `async_dispatch` instead.
@@ -395,7 +388,6 @@ pub fn async_send(req: Request(String)) -> Result(Reference, HttpError) {
   |> async_dispatch(req)
 }
 
-// TODO: refine error type
 /// Send a HTTP request of unicode data using the default configuration.
 ///
 /// If you wish to use some other configuration use `dispatch` instead.

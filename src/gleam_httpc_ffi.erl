@@ -1,5 +1,5 @@
 -module(gleam_httpc_ffi).
--export([default_user_agent/0, normalise_error/1, stream_next/1, receive_stream_start/2, receive_stream_chunk/2, receive_stream_end/2]).
+-export([default_user_agent/0, normalise_error/1, stream_next/1, coerce_stream_message/1]).
 
 %%====================================================================
 %% Streaming
@@ -11,31 +11,11 @@ stream_next(HandlerPid) when is_pid(HandlerPid) ->
    _  -> {error, nil}
  end.
 
-receive_stream_start(ReqId, Timeout) ->
-   receive
-     {http, {ReqId, stream_start, Headers, Pid}} -> {ok, {Headers, Pid}};
-     {http, {ReqId, {error, Reason}}} -> {error, Reason}
-   after Timeout ->
-     {error, timeout}
-   end.
-
-receive_stream_chunk(ReqId, Timeout) ->
-   receive
-     {http, {ReqId, stream, BinBodyPart}} -> {ok, BinBodyPart};
-     {http, {ReqId, {error, Reason}}} -> {error, Reason}
-   after Timeout ->
-     {error, timeout}
-   end.
-
-receive_stream_end(ReqId, Timeout) ->
-   receive
-     {http, {ReqId, stream_end, Headers}} -> {ok, Headers};
-     {http, {ReqId, {error, Reason}}} -> {error, Reason}
-   after Timeout ->
-     {error, timeout}
-   end.
-    
-
+coerce_stream_message({http, {ReqId, stream_start, Headers, Pid}}) -> {stream_start, ReqId, Headers, Pid};
+coerce_stream_message({http, {ReqId, stream, BinBodyPart}}) -> {stream_chunk, ReqId, BinBodyPart};
+coerce_stream_message({http, {ReqId, stream_end, Headers}}) -> {stream_end, ReqId, Headers};
+coerce_stream_message({http, {ReqId, {error, Reason}}}) -> {stream_error, ReqId, normalise_error(Reason)}. 
+  
 %%====================================================================
 %% Error normalization
 %%====================================================================
