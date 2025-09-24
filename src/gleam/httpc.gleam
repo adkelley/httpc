@@ -4,7 +4,6 @@ import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
 import gleam/erlang/charlist.{type Charlist}
 import gleam/erlang/process
-import gleam/erlang/reference.{type Reference}
 import gleam/http.{type Method}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response, Response}
@@ -75,17 +74,20 @@ type ErlVerifyOption {
 
 pub type HttpSocket
 
-type Headers =
-  List(#(String, String))
+pub type RequestIdentifier
 
-type RequestId =
-  Reference
+pub type RawStreamMessage {
+  RawStreamStart(RequestIdentifier, List(#(Charlist, Charlist)), process.Pid)
+  RawStreamChunk(RequestIdentifier, BitArray)
+  RawStreamEnd(RequestIdentifier, List(#(Charlist, Charlist)))
+  RawStreamError(RequestIdentifier, HttpError)
+}
 
 pub type StreamMessage {
-  StreamStart(RequestId, Headers, process.Pid)
-  StreamChunk(RequestId, BitArray)
-  StreamEnd(RequestId, Headers)
-  StreamError(RequestId, HttpError)
+  StreamStart(RequestIdentifier, List(#(String, String)), process.Pid)
+  StreamChunk(RequestIdentifier, BitArray)
+  StreamEnd(RequestIdentifier, List(#(String, String)))
+  StreamError(RequestIdentifier, HttpError)
 }
 
 @external(erlang, "httpc", "request")
@@ -111,20 +113,20 @@ fn erl_request_no_body(
 )
 
 @external(erlang, "httpc", "request")
-fn erl_request_async_no_body(
+fn erl_stream_request_no_body(
   a: Method,
   b: #(Charlist, List(#(Charlist, Charlist))),
   c: List(ErlHttpOption),
   d: List(ErlOption),
-) -> Result(Reference, Dynamic)
+) -> Result(RequestIdentifier, Dynamic)
 
 @external(erlang, "httpc", "request")
-fn erl_request_async(
+fn erl_stream_request(
   a: Method,
   b: #(Charlist, List(#(Charlist, Charlist)), Charlist, BitArray),
   c: List(ErlHttpOption),
   d: List(ErlOption),
-) -> Result(Reference, Dynamic)
+) -> Result(RequestIdentifier, Dynamic)
 
 fn string_header(header: #(Charlist, Charlist)) -> #(String, String) {
   let #(k, v) = header
@@ -143,21 +145,12 @@ pub fn send_bits(
   |> dispatch_bits(req)
 }
 
-/// Send an asynchronous HTTP request of binary data using the default configuration.
-///
-/// If you wish to use some other configuration use `async_dispatch_bits` instead.
-///
-pub fn async_send_bits(req: Request(BitArray)) -> Result(Reference, HttpError) {
-  configure()
-  |> async_dispatch_bits(req)
-}
-
-/// Send an asynchronous HTTP request of binary data
+/// Send a HTTP stream request of binary data
 /// 
-pub fn async_dispatch_bits(
+pub fn dispatch_stream_bits(
   config: Configuration,
   req: Request(BitArray),
-) -> Result(Reference, HttpError) {
+) -> Result(RequestIdentifier, HttpError) {
   let erl_url =
     req
     |> request.to_uri
@@ -182,7 +175,7 @@ pub fn async_dispatch_bits(
     case req.method {
       http.Options | http.Head | http.Get -> {
         let erl_req = #(erl_url, erl_headers)
-        erl_request_async_no_body(
+        erl_stream_request_no_body(
           req.method,
           erl_req,
           erl_http_options,
@@ -196,7 +189,7 @@ pub fn async_dispatch_bits(
           |> result.unwrap("application/octet-stream")
           |> charlist.from_string
         let erl_req = #(erl_url, erl_headers, erl_content_type, req.body)
-        erl_request_async(req.method, erl_req, erl_http_options, erl_options)
+        erl_stream_request(req.method, erl_req, erl_http_options, erl_options)
       }
     }
     |> result.map_error(normalise_error),
@@ -207,39 +200,67 @@ pub fn async_dispatch_bits(
 
 /// Triggers the next asynchronous streaming message to be sent to the calling process
 /// designated by `pid`. 
-@external(erlang, "gleam_httpc_ffi", "stream_next")
-pub fn stream_next(pid: process.Pid) -> Result(Nil, Nil)
+/// 
+@external(erlang, "gleam_httpc_ffi", "receive_next_stream_message")
+pub fn receive_next_stream_message(id: process.Pid) -> Nil
 
 @external(erlang, "gleam_httpc_ffi", "coerce_stream_message")
-fn unsafe_decode(msg: Dynamic) -> StreamMessage
+fn decode_stream_message(msg: Dynamic) -> RawStreamMessage
 
-fn map_stream_message(mapper: fn(StreamMessage) -> t) -> fn(Dynamic) -> t {
-  fn(message) { mapper(unsafe_decode(message)) }
-}
-
-fn select_stream_messages(
+/// Configure a selector to receive stream messages
+/// 
+/// Note this will receive messages from all processes that sent a HTTP stream request;
+/// for example using `send_stream_request`, rather than any specific one.
+/// In this case, for finer grained processing, you can filter on the `RequestIdentifier`,
+/// which is the first argument in the `StreamMessage` constructor.
+/// If you wish to only handle stream messages from one process, then use one
+/// process per HTTP stream request. 
+///
+/// ## Example
+///
+/// ```gleam
+/// process.new_selector() |> select_stream_messages(raw_stream_mapper())
+/// ```
+/// 
+pub fn select_stream_messages(
   selector: process.Selector(t),
-  mapper: fn(StreamMessage) -> t,
+  mapper: fn(RawStreamMessage) -> t,
 ) -> process.Selector(t) {
-  let http = atom.create("http")
+  let http = atom.create(http.scheme_to_string(http.Http))
+  let map_stream_message = fn(mapper) {
+    fn(message) { mapper(decode_stream_message(message)) }
+  }
 
   selector
   |> process.select_record(http, 1, map_stream_message(mapper))
 }
 
-/// Initialize asychronous streaming by confiquring a selector to receive stream messages.
+/// Converts a raw stream message into a user-facing `StreamMessage`.
 ///
-/// Note this will receive messages from all processes that sent an asychronous
-/// HTTP request; for example using `async_send`, rather than any specific one.
-/// In this case, for finer grained processing, you can filter on the request_id,
-/// which is the first argument in the `StreamMessage` constructor.
-/// If you wish to only handle stream messages from one process, then use one
-/// process per asychronous HTTP request. 
+/// This mapper is primarily used to transform header values from
+/// `List(#(Charlist, Charlist))` into the more idiomatic `List(#(String, String))`,
+/// which is easier to work with in Gleam.
 ///
-pub fn initialize_stream_selector() -> process.Selector(StreamMessage) {
-  let handle = fn(msg: StreamMessage) { msg }
-  process.new_selector()
-  |> select_stream_messages(handle)
+/// You can use this function as the `mapper` argument to `select_stream_messages/2`,
+/// or you can supply your own custom mapper if you need additional transformations.
+///
+/// ## Example
+///
+/// ```gleam
+/// process.new_selector() |> select_stream_messages(raw_stream_mapper())
+/// ```
+///
+pub fn raw_stream_mapper() -> fn(RawStreamMessage) -> StreamMessage {
+  fn(msg: RawStreamMessage) {
+    case msg {
+      RawStreamChunk(request_id, bin_part) -> StreamChunk(request_id, bin_part)
+      RawStreamStart(request_id, headers, pid) ->
+        StreamStart(request_id, list.map(headers, string_header), pid)
+      RawStreamEnd(request_id, headers) ->
+        StreamEnd(request_id, list.map(headers, string_header))
+      RawStreamError(request_id, reason) -> StreamError(request_id, reason)
+    }
+  }
 }
 
 // TODO: refine error type
@@ -368,24 +389,56 @@ pub fn dispatch(
   }
 }
 
-/// Send a asynchronus HTTP request of unicode data.
+/// Send a HTTP stream request of unicode data using a custom `Configuration`.
+/// 
+/// This function supports only the `stream: {self, once}` mode from `httpc`, which is a
+/// **pull-based** streaming approach. In this mode, the caller must explicitly request
+/// the next stream message using `receive_next_stream_message/1`.
 ///
-pub fn async_dispatch(
+/// If the request is successfully dispatched, this function returns a `RequestIdentifier`.
+/// This identifier is useful when managing multiple concurrent streaming requests,
+/// allowing you to match incoming messages to the originating request.
+///
+/// Once you've configured a selector to receive stream messages (see `select_stream_messages/1`),
+/// the other `StreamMessage` variants will be delivered to the user
+/// 
+/// With the exception of timeout errors, all other errors will be delivered via:
+/// `StreamError(RequestIdentifier, HttpError)`.
+///
+pub fn dispatch_stream_request(
   config: Configuration,
   request: Request(String),
-) -> Result(Reference, HttpError) {
+) -> Result(RequestIdentifier, HttpError) {
   let request = request.map(request, bit_array.from_string)
-  use request_id <- result.try(async_dispatch_bits(config, request))
+  use request_id <- result.try(dispatch_stream_bits(config, request))
   Ok(request_id)
 }
 
-/// Send a HTTP asychronous request of unicode data using the default configuration.
+/// Sends an HTTP streaming request with a Unicode body using the default `Configuration`.
 ///
-/// If you wish to use some other configuration use `async_dispatch` instead.
+/// This function supports only the `stream: {self, once}` mode from `httpc`, which is a
+/// **pull-based** streaming approach. In this mode, after receiving the `handler_pid`, from the
+/// `StreamStart` message, the caller must explicitly request the next stream message
+/// using `receive_next_stream_message/1`.the caller must explicitly request
 ///
-pub fn async_send(req: Request(String)) -> Result(Reference, HttpError) {
+/// If the request is successfully dispatched, this function returns a `RequestIdentifier`.
+/// This identifier is useful when managing multiple concurrent streaming requests,
+/// allowing you to match incoming messages to the originating request.
+///
+/// Once you've configured a selector to receive stream messages (see `select_stream_messages/1`),
+/// the other `StreamMessage` variants will be delivered to the user
+/// 
+/// With the exception of timeout errors, all other errors will be delivered via:
+/// `StreamError(RequestIdentifier, HttpError)`.
+///
+/// If you want to customize the streaming behavior, use `dispatch_stream_request/2`
+/// with a custom `Configuration` instead.
+/// 
+pub fn send_stream_request(
+  req: Request(String),
+) -> Result(RequestIdentifier, HttpError) {
   configure()
-  |> async_dispatch(req)
+  |> dispatch_stream_request(req)
 }
 
 /// Send a HTTP request of unicode data using the default configuration.

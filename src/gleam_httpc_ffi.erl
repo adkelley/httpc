@@ -1,20 +1,18 @@
 -module(gleam_httpc_ffi).
--export([default_user_agent/0, normalise_error/1, stream_next/1, coerce_stream_message/1]).
+-export([default_user_agent/0, normalise_error/1, receive_next_stream_message/1, coerce_stream_message/1]).
 
 %%====================================================================
 %% Streaming
 %%====================================================================
  %% Helper: call stream_next with whatever the handler expects
-stream_next(HandlerPid) when is_pid(HandlerPid) ->
- case httpc:stream_next(HandlerPid) of
-   ok -> {ok, nil};
-   _  -> {error, nil}
- end.
+receive_next_stream_message(HandlerPid) when is_pid(HandlerPid) ->
+ httpc:stream_next(HandlerPid),
+ nil.
 
-coerce_stream_message({http, {ReqId, stream_start, Headers, Pid}}) -> {stream_start, ReqId, Headers, Pid};
-coerce_stream_message({http, {ReqId, stream, BinBodyPart}}) -> {stream_chunk, ReqId, BinBodyPart};
-coerce_stream_message({http, {ReqId, stream_end, Headers}}) -> {stream_end, ReqId, Headers};
-coerce_stream_message({http, {ReqId, {error, Reason}}}) -> {stream_error, ReqId, normalise_error(Reason)}. 
+coerce_stream_message({http, {ReqId, stream_start, Headers, Pid}}) -> {raw_stream_start, ReqId, Headers, Pid};
+coerce_stream_message({http, {ReqId, stream, BinBodyPart}}) when is_binary(BinBodyPart) -> {raw_stream_chunk, ReqId, BinBodyPart};
+coerce_stream_message({http, {ReqId, stream_end, Headers}}) -> {raw_stream_end, ReqId, Headers};
+coerce_stream_message({http, {ReqId, {error, Reason}}}) -> {raw_stream_error, ReqId, normalise_error(Reason)}. 
   
 %%====================================================================
 %% Error normalization

@@ -9,8 +9,6 @@ Bindings to Erlang's built in HTTP client, `httpc`.
 gleam add gleam_httpc@5
 ```
 
-## Synchronous request
-
 ```gleam
 import gleam/http/request
 import gleam/http/response
@@ -40,31 +38,43 @@ pub fn send_request() {
 }
 ```
 
-## Asynchronous (i.e., Streaming) requests
+## Http streaming requests
+
+`httpc` supports `stream:{self, once}` mode, which is a **pull-based** approach for
+accepting streamed responses. In this mode, after receiving the `handler_pid`, from the
+`StreamStart` message, the caller must explicitly request the next stream message
+using `receive_next_stream_message/1`.
 
 ```gleam
 import gleam/http.{Get}
 import gleam/http/request
 import gleam/httpc
+import gleam/process
 
-pub fn async_stream_self_once() {
+/// Receive a streamed response from Postman Echo. The number of
+/// stream chunks we receive is 1, as we specfied in the endpoint
+///
+pub fn stream_self_once() {
   let req =
     request.new()
     |> request.set_method(Get)
     |> request.set_host("postman-echo.com")
     |> request.set_path("/stream/1")
 
-  let assert Ok(request_id) = httpc.async_send(req)
-  let selector = httpc.initialize_stream_selector()
+  // Send the streaming request to the server
+  let assert Ok(request_id) = httpc.send_stream_request(req)
+  
+  // Configure the selector
+  let selector = process.new_selector() |> httpc.select_stream_messages(httpc.raw_stream_mapper())
 
-  let assert Ok(httpc.StreamStart(_request_id_, _headers, pid)) =
+  let assert Ok(httpc.StreamStart(_request_id_, _headers, handler_pid)) =
     process.selector_receive(selector, 1000)
 
-  let assert Ok(Nil) = httpc.stream_next(pid)
+  let _nil = httpc.receive_next_stream_message(handler_pid)
   let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
     process.selector_receive(selector, 1000)
 
-  let assert Ok(Nil) = httpc.stream_next(pid)
+  let _nil = httpc.receive_next_stream_message(handler_pid)
   let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
     process.selector_receive(selector, 1000)
 }

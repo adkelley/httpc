@@ -163,26 +163,59 @@ pub fn timeout_error_test() {
     == Error(httpc.ResponseTimeout)
 }
 
-pub fn async_stream_self_once_test() {
+pub fn send_stream_request_test() {
   let req =
     request.new()
     |> request.set_method(Get)
     |> request.set_host("postman-echo.com")
     |> request.set_path("/stream/1")
 
-  let assert Ok(request_id) = httpc.async_send(req)
-  let selector = httpc.initialize_stream_selector()
+  let assert Ok(request_id) = httpc.send_stream_request(req)
+  let mapper = httpc.raw_stream_mapper()
+
+  let selector = process.new_selector() |> httpc.select_stream_messages(mapper)
 
   let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let assert Ok(Nil) = httpc.stream_next(pid)
+  let _nil = httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let assert Ok(Nil) = httpc.stream_next(pid)
+  let _nil = httpc.receive_next_stream_message(pid)
+  let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
+}
+
+pub fn dispatch_stream_request_test() {
+  let req =
+    request.new()
+    |> request.set_method(Get)
+    |> request.set_host("postman-echo.com")
+    |> request.set_path("/stream/1")
+
+  let config =
+    httpc.configure()
+    |> httpc.timeout(5000)
+
+  let assert Ok(request_id) = httpc.dispatch_stream_request(config, req)
+
+  let mapper = httpc.raw_stream_mapper()
+  let selector = process.new_selector() |> httpc.select_stream_messages(mapper)
+
+  let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
+
+  let _nil = httpc.receive_next_stream_message(pid)
+  let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
+    process.selector_receive(selector, 1000)
+  assert request_id_ == request_id
+
+  let _nil = httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
