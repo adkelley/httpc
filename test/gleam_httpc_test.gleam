@@ -171,20 +171,18 @@ pub fn send_stream_request_test() {
     |> request.set_path("/stream/1")
 
   let assert Ok(request_id) = httpc.send_stream_request(req)
-  let mapper = httpc.raw_stream_mapper()
-
-  let selector = process.new_selector() |> httpc.select_stream_messages(mapper)
+  let selector = httpc.select_stream_messages()
 
   let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let _nil = httpc.receive_next_stream_message(pid)
+  httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let _nil = httpc.receive_next_stream_message(pid)
+  httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
@@ -203,20 +201,35 @@ pub fn dispatch_stream_request_test() {
 
   let assert Ok(request_id) = httpc.dispatch_stream_request(config, req)
 
-  let mapper = httpc.raw_stream_mapper()
-  let selector = process.new_selector() |> httpc.select_stream_messages(mapper)
+  let selector = httpc.select_stream_messages()
 
   let assert Ok(httpc.StreamStart(request_id_, _headers, pid)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let _nil = httpc.receive_next_stream_message(pid)
+  httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamChunk(request_id_, _binary_part)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
 
-  let _nil = httpc.receive_next_stream_message(pid)
+  httpc.receive_next_stream_message(pid)
   let assert Ok(httpc.StreamEnd(request_id_, _headers)) =
     process.selector_receive(selector, 1000)
   assert request_id_ == request_id
+}
+
+pub fn send_stream_request_error_test() {
+  // httpstat.us has a special “500?fail=true” mode that closes the
+  // connection mid-response.  This results in httpc reporting a
+  // SocketClosedRemotely
+  let req =
+    request.new()
+    |> request.set_method(Get)
+    |> request.set_host("httpstat.us")
+    |> request.set_path("/500?fail=true")
+
+  let selector = httpc.select_stream_messages()
+  let assert Ok(_request_id) = httpc.send_stream_request(req)
+  let assert Ok(httpc.StreamError(_request_id, httpc.SocketClosedRemotely)) =
+    process.selector_receive(selector, 1000)
 }

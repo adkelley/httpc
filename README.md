@@ -46,38 +46,55 @@ accepting streamed responses. In this mode, after receiving the `handler_pid`, f
 using `receive_next_stream_message/1`.
 
 ```gleam
+import gleam/bit_array
+import gleam/erlang/process.{type Pid, type Selector}
 import gleam/http.{Get}
 import gleam/http/request
-import gleam/httpc
-import gleam/process
+import gleam/httpc.{type HttpError, type RequestIdentifier,
+type StreamMessage}
 
 /// Receive a streamed response from Postman Echo. The number of
-/// stream chunks we receive is 1, as we specfied in the endpoint
+/// stream chunks we receive is 5, as we specfied by the endpoint
 ///
-pub fn stream_self_once() {
+pub fn main() -> Nil {
   let req =
     request.new()
     |> request.set_method(Get)
     |> request.set_host("postman-echo.com")
-    |> request.set_path("/stream/1")
-
+    |> request.set_path("/stream/5")
   // Send the streaming request to the server
   let assert Ok(request_id) = httpc.send_stream_request(req)
-  
   // Configure the selector
-  let selector = process.new_selector() |> httpc.select_stream_messages(httpc.raw_stream_mapper())
-
-  let assert Ok(httpc.StreamStart(_request_id_, _headers, handler_pid)) =
-    process.selector_receive(selector, 1000)
-
-  let _nil = httpc.receive_next_stream_message(handler_pid)
-  let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
-    process.selector_receive(selector, 1000)
-
-  let _nil = httpc.receive_next_stream_message(handler_pid)
-  let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
-    process.selector_receive(selector, 1000)
+  let selector = httpc.select_stream_messages()
+  let assert Ok(chunks) =
+    loop(request_id, selector, process.self(), bit_array.from_string(""))
+  let _ = echo bit_array.to_string(chunks)
+  Nil
 }
+
+// Recursively pulls chunks from the active stream handler until
+// completion (e.g., StreamEnd).
+fn loop(
+  request_id: RequestIdentifier,
+  selector: Selector(StreamMessage),
+  handler_pid: Pid,
+  chunks: BitArray,
+) -> Result(BitArray, HttpError) {
+  case process.selector_receive(selector, 1000) {
+    Ok(httpc.StreamStart(request_id, _headers, handler_pid)) -> {
+      httpc.receive_next_stream_message(handler_pid)
+      loop(request_id, selector, handler_pid, chunks)
+    }
+
+    Ok(httpc.StreamChunk(request_id, chunk)) -> {
+      httpc.receive_next_stream_message(handler_pid)
+      loop(request_id,
+           selector, handler_pid, bit_array.append(chunks, chunk))
+    }
+    Ok(httpc.StreamEnd(_request_id, _headers)) -> Ok(chunks)
+    Ok(httpc.StreamError(_request_id, error)) -> Error(error)
+    Error(Nil) -> Error(httpc.ResponseTimeout)
+  }
 }
 ```
 

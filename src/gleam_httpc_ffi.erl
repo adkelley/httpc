@@ -30,6 +30,8 @@ normalise_error(Error = {failed_connect, Opts}) ->
     {failed_to_connect, normalise_ip_error(Ipv4), normalise_ip_error(Ipv6)};
 normalise_error(timeout) -> 
     response_timeout;
+normalise_error(socket_closed_remotely) ->
+    socket_closed_remotely;
 normalise_error(Error) ->
     erlang:error({unexpected_httpc_error, Error}).
 

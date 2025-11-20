@@ -18,6 +18,8 @@ pub type HttpError {
   FailedToConnect(ip4: ConnectError, ip6: ConnectError)
   /// The response was not received within the configured timeout period.
   ResponseTimeout
+  /// The connection was closed mid-response
+  SocketClosedRemotely
 }
 
 pub type ConnectError {
@@ -72,22 +74,64 @@ type ErlVerifyOption {
   VerifyNone
 }
 
-pub type HttpSocket
-
+/// Identifies a particular HTTP request used to match with incoming
+/// `StreamMessage`s. This identifier is useful when managing multiple
+/// concurrent streaming requests.
 pub type RequestIdentifier
 
-pub type RawStreamMessage {
+// When streaming, this raw form preserves the `Charlist` headers references
+// exactly as they arrive, so selectors can match on them without extra
+// allocations. We use `select_stream_messages` to turn them into  `
+// StreamMessage`s in order to work with `String` headers.
+// 
+type RawStreamMessage {
   RawStreamStart(RequestIdentifier, List(#(Charlist, Charlist)), process.Pid)
   RawStreamChunk(RequestIdentifier, BitArray)
   RawStreamEnd(RequestIdentifier, List(#(Charlist, Charlist)))
   RawStreamError(RequestIdentifier, HttpError)
 }
 
+// Converts a raw stream message into a user-facing `StreamMessage`.
+// It transforms header values from `List(#(Charlist, Charlist))` into the more
+// idiomatic `List(#(String, String))`, which is easier to work with in Gleam.
+//
+fn raw_stream_mapper() -> fn(RawStreamMessage) -> StreamMessage {
+  fn(msg: RawStreamMessage) {
+    case msg {
+      RawStreamChunk(request_id, bin_part) -> StreamChunk(request_id, bin_part)
+      RawStreamStart(request_id, headers, pid) ->
+        StreamStart(request_id, list.map(headers, string_header), pid)
+      RawStreamEnd(request_id, headers) ->
+        StreamEnd(request_id, list.map(headers, string_header))
+      RawStreamError(request_id, reason) -> StreamError(request_id, reason)
+    }
+  }
+}
+
+/// Messages delivered to the caller when `dispatch_stream_bits` or
+/// `dispatch_stream_message` is executed (i.e., streaming mode), so that you
+///  can pull the response body as it becomes available.
+/// 
 pub type StreamMessage {
-  StreamStart(RequestIdentifier, List(#(String, String)), process.Pid)
-  StreamChunk(RequestIdentifier, BitArray)
-  StreamEnd(RequestIdentifier, List(#(String, String)))
-  StreamError(RequestIdentifier, HttpError)
+  /// Sent exactly once when the server response begins. The returned `pid`
+  /// identifies the process and must be passed to `httpc:stream_next`
+  /// whenever you are ready for the next chunk.
+  StreamStart(
+    request_id: RequestIdentifier,
+    headers: List(#(String, String)),
+    pid: process.Pid,
+  )
+  /// Sent for every chunk of response data that the worker emits. Each chunk
+  /// must be explicitly requested by calling `httpc:stream_next/1` with the pid
+  /// supplied in `StreamStart`.
+  StreamChunk(request_id: RequestIdentifier, chunk: BitArray)
+  /// Sent exactly once after the final chunk has been consumed. Chunked
+  /// transfer encoding may add trailers, so there can be more headers here than
+  /// were present in the initial `StreamStart`.
+  StreamEnd(request_id: RequestIdentifier, trailers: List(#(String, String)))
+  /// Sent whenever the stream cannot be completed, either because the request
+  /// failed or an error occurred while consuming chunks.
+  StreamError(request_id: RequestIdentifier, error: HttpError)
 }
 
 @external(erlang, "httpc", "request")
@@ -145,7 +189,10 @@ pub fn send_bits(
   |> dispatch_bits(req)
 }
 
-/// Send a HTTP stream request of binary data
+/// Send a HTTP stream request of binary data.
+/// 
+/// Returns a `RequestIdentifier` that can be matched with incoming
+/// `StreamMessage`s.
 /// 
 pub fn dispatch_stream_bits(
   config: Configuration,
@@ -198,7 +245,7 @@ pub fn dispatch_stream_bits(
   Ok(request_id)
 }
 
-/// Triggers the next asynchronous streaming message to be sent to the calling process
+/// Triggers the next streaming message to be sent to the calling process
 /// designated by `pid`. 
 /// 
 @external(erlang, "gleam_httpc_ffi", "receive_next_stream_message")
@@ -207,60 +254,23 @@ pub fn receive_next_stream_message(id: process.Pid) -> Nil
 @external(erlang, "gleam_httpc_ffi", "coerce_stream_message")
 fn decode_stream_message(msg: Dynamic) -> RawStreamMessage
 
-/// Configure a selector to receive stream messages
+/// Configure the selector that receives stream messages
 /// 
-/// Note this will receive messages from all processes that sent a HTTP stream request;
-/// for example using `send_stream_request`, rather than any specific one.
-/// In this case, for finer grained processing, you can filter on the `RequestIdentifier`,
-/// which is the first argument in the `StreamMessage` constructor.
-/// If you wish to only handle stream messages from one process, then use one
-/// process per HTTP stream request. 
-///
-/// ## Example
-///
-/// ```gleam
-/// process.new_selector() |> select_stream_messages(raw_stream_mapper())
-/// ```
+/// Note this will receive messages from all processes that sent a HTTP stream
+/// request; for example using `send_stream_request`, rather than any specific
+/// one. In this case, for finer grained processing, you can filter on the
+/// `RequestIdentifier`, which is the first argument in the `StreamMessage`
+/// constructor. If you wish to only handle stream messages from one process,
+/// then use one process per HTTP stream request. 
 /// 
-pub fn select_stream_messages(
-  selector: process.Selector(t),
-  mapper: fn(RawStreamMessage) -> t,
-) -> process.Selector(t) {
+pub fn select_stream_messages() -> process.Selector(StreamMessage) {
   let http = atom.create(http.scheme_to_string(http.Http))
+  let mapper = raw_stream_mapper()
   let map_stream_message = fn(mapper) {
     fn(message) { mapper(decode_stream_message(message)) }
   }
-
-  selector
+  process.new_selector()
   |> process.select_record(http, 1, map_stream_message(mapper))
-}
-
-/// Converts a raw stream message into a user-facing `StreamMessage`.
-///
-/// This mapper is primarily used to transform header values from
-/// `List(#(Charlist, Charlist))` into the more idiomatic `List(#(String, String))`,
-/// which is easier to work with in Gleam.
-///
-/// You can use this function as the `mapper` argument to `select_stream_messages/2`,
-/// or you can supply your own custom mapper if you need additional transformations.
-///
-/// ## Example
-///
-/// ```gleam
-/// process.new_selector() |> select_stream_messages(raw_stream_mapper())
-/// ```
-///
-pub fn raw_stream_mapper() -> fn(RawStreamMessage) -> StreamMessage {
-  fn(msg: RawStreamMessage) {
-    case msg {
-      RawStreamChunk(request_id, bin_part) -> StreamChunk(request_id, bin_part)
-      RawStreamStart(request_id, headers, pid) ->
-        StreamStart(request_id, list.map(headers, string_header), pid)
-      RawStreamEnd(request_id, headers) ->
-        StreamEnd(request_id, list.map(headers, string_header))
-      RawStreamError(request_id, reason) -> StreamError(request_id, reason)
-    }
-  }
 }
 
 // TODO: refine error type
@@ -318,12 +328,12 @@ pub opaque type Configuration {
   Builder(
     /// Whether to verify the TLS certificate of the server.
     ///
-    /// This defaults to `True`, meaning that the TLS certificate will be verified
-    /// unless you call this function with `False`.
+    /// This defaults to `True`, meaning that the TLS certificate will be
+    /// verified unless you call this function with `False`.
     ///
     /// Setting this to `False` can make your application vulnerable to
-    /// man-in-the-middle attacks and other security risks. Do not do this unless
-    /// you are sure and you understand the risks.
+    /// man-in-the-middle attacks and other security risks. Do not do this
+    /// unless you are sure and you understand the risks.
     ///
     verify_tls: Bool,
     /// Whether to follow redirects.
@@ -343,6 +353,7 @@ pub opaque type Configuration {
 /// - Redirects are not followed.
 /// - The timeout for the response to be received is 30 seconds from when the
 ///   request is sent.
+/// 
 pub fn configure() -> Configuration {
   Builder(verify_tls: True, follow_redirects: False, timeout: 30_000)
 }
@@ -374,7 +385,7 @@ pub fn timeout(config: Configuration, timeout: Int) -> Configuration {
   Builder(..config, timeout:)
 }
 
-/// Send a synchronus HTTP request of unicode data.
+/// Send a HTTP request of unicode data.
 ///
 pub fn dispatch(
   config: Configuration,
@@ -391,20 +402,61 @@ pub fn dispatch(
 
 /// Send a HTTP stream request of unicode data using a custom `Configuration`.
 /// 
-/// This function supports only the `stream: {self, once}` mode from `httpc`, which is a
-/// **pull-based** streaming approach. In this mode, the caller must explicitly request
-/// the next stream message using `receive_next_stream_message/1`.
+/// This function supports only the `stream: {self, once}` mode from `httpc`,
+/// which is a **pull-based** streaming approach. In this mode, the caller must
+/// explicitly request the next stream message using
+/// `receive_next_stream_message`.
 ///
-/// If the request is successfully dispatched, this function returns a `RequestIdentifier`.
-/// This identifier is useful when managing multiple concurrent streaming requests,
-/// allowing you to match incoming messages to the originating request.
+/// If the request is successfully dispatched, this function returns a
+/// `RequestIdentifier`. This identifier is useful when managing multiple
+/// concurrent streaming requests, allowing you to match incoming messages to
+/// the originating request.
 ///
-/// Once you've configured a selector to receive stream messages (see `select_stream_messages/1`),
-/// the other `StreamMessage` variants will be delivered to the user
+/// Once you've configured a selector to receive stream messages (see
+/// `select_stream_messages`), the other `StreamMessage` variants will be
+/// delivered to the caller.
 /// 
-/// With the exception of timeout errors, all other errors will be delivered via:
-/// `StreamError(RequestIdentifier, HttpError)`.
+/// With the exception of timeout errors, all other errors will be delivered
+/// via: `StreamError(RequestIdentifier, HttpError)`.  
 ///
+/// Example:
+/// 
+/// ```gleam
+/// import gleam/http.{Get}
+/// import gleam/http/request
+/// import gleam/httpc
+/// import gleam/process
+/// 
+/// // Receive a streamed response from Postman Echo. The number of
+/// // stream chunks we receive is 1, as we specfied in the endpoint
+/// pub fn stream_self_once() {
+///    let req =
+///      request.new()
+///      |> request.set_method(Get)
+///      |> request.set_host("postman-echo.com")
+///      |> request.set_path("/stream/1")
+///  
+///    let config =
+///       httpc.configure()
+///       |> httpc.timeout(5000)
+/// 
+///    // Send the streaming request to the server
+///    let assert Ok(request_id) =
+///       httpc.dispatch_stream_request(config, req)
+/// 
+///    // Configure the selector
+///    let selector = httpc.select_stream_messages()
+///    let assert Ok(httpc.StreamStart(_request_id_, _headers, handler_pid)) =
+///       process.selector_receive(selector, 5000)
+///    httpc.receive_next_stream_message(handler_pid)
+///    let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
+///       process.selector_receive(selector, 5000)
+///    httpc.receive_next_stream_message(handler_pid)
+///    let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
+///       process.selector_receive(selector, 5000)
+/// }
+/// ```
+/// 
 pub fn dispatch_stream_request(
   config: Configuration,
   request: Request(String),
@@ -414,25 +466,63 @@ pub fn dispatch_stream_request(
   Ok(request_id)
 }
 
-/// Sends an HTTP streaming request with a Unicode body using the default `Configuration`.
+/// Sends an HTTP streaming request with a Unicode body using the default
+/// `Configuration`.
 ///
-/// This function supports only the `stream: {self, once}` mode from `httpc`, which is a
-/// **pull-based** streaming approach. In this mode, after receiving the `handler_pid`, from the
-/// `StreamStart` message, the caller must explicitly request the next stream message
-/// using `receive_next_stream_message/1`.the caller must explicitly request
+/// If you wish to use some other configuration use `dispatch_stream_request`
+/// instead.
 ///
-/// If the request is successfully dispatched, this function returns a `RequestIdentifier`.
-/// This identifier is useful when managing multiple concurrent streaming requests,
-/// allowing you to match incoming messages to the originating request.
+/// This function supports only the `stream: {self, once}` mode from `httpc`,
+/// which is a **pull-based** streaming approach. In this mode, after receiving
+/// the `handler_pid`, from the `StreamStart` message, the caller must
+/// explicitly request the next stream message using
+/// `receive_next_stream_message`.
 ///
-/// Once you've configured a selector to receive stream messages (see `select_stream_messages/1`),
-/// the other `StreamMessage` variants will be delivered to the user
+/// If the request is successfully dispatched, this function returns a
+/// `RequestIdentifier`. This identifier is useful when managing multiple
+/// concurrent streaming requests, allowing you to match incoming messages to
+/// the originating request.
+///
+/// Once you've configured a selector to receive stream messages (see
+/// `select_stream_messages`), the other `StreamMessage` variants will be
+/// delivered to the user
 /// 
-/// With the exception of timeout errors, all other errors will be delivered via:
-/// `StreamError(RequestIdentifier, HttpError)`.
+/// With the exception of timeout errors, all other errors will be delivered
+/// via: `StreamError(RequestIdentifier, HttpError)`.
 ///
-/// If you want to customize the streaming behavior, use `dispatch_stream_request/2`
-/// with a custom `Configuration` instead.
+/// If you to use
+/// `dispatch_stream_request` with a custom `Configuration` instead.
+/// 
+/// ```gleam
+/// import gleam/http.{Get}
+/// import gleam/http/request
+/// import gleam/httpc
+/// import gleam/process
+/// 
+/// // Receive a streamed response from Postman Echo. The number of
+/// // stream chunks we receive is 1, as we specfied in the endpoint
+/// pub fn stream_self_once() {
+///    let req =
+///      request.new()
+///      |> request.set_method(Get)
+///      |> request.set_host("postman-echo.com")
+///      |> request.set_path("/stream/1")
+/// 
+///    // Send the streaming request to the server
+///    let assert Ok(request_id) = httpc.send_stream_request(req)
+/// 
+///    // Configure the selector
+///    let selector = httpc.select_stream_messages()
+///    let assert Ok(httpc.StreamStart(_request_id_, _headers, handler_pid)) =
+///       process.selector_receive(selector, 1000)
+///    httpc.receive_next_stream_message(handler_pid)
+///    let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
+///       process.selector_receive(selector, 1000)
+///    httpc.receive_next_stream_message(handler_pid)
+///    let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
+///       process.selector_receive(selector, 1000)
+/// }
+/// ```
 /// 
 pub fn send_stream_request(
   req: Request(String),
