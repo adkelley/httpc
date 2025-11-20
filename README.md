@@ -40,45 +40,72 @@ pub fn send_request() {
 
 ## Http streaming requests
 
-`httpc` supports `stream:{self, once}` mode, which is a **pull-based** approach for
-accepting streamed responses. In this mode, after receiving the `handler_pid`, from the
-`StreamStart` message, the caller must explicitly request the next stream message
-using `receive_next_stream_message/1`.
+`httpc.gleam` supports the `ErlOption`, `Stream(#(Self, Once))`, for accepting streamed responses.
+In this mode, after receiving the `stream_pid`, from the `StreamStart` message, the caller
+must explicitly request the next stream message using the `receive_next_stream_message`.
 
 ```gleam
+import gleam/erlang/process.{type Pid}
 import gleam/http.{Get}
 import gleam/http/request
-import gleam/httpc
-import gleam/process
+import gleam/httpc.{type StreamMessage}
+import gleam/otp/actor
 
-/// Receive a streamed response from Postman Echo. The number of
-/// stream chunks we receive is 1, as we specfied in the endpoint
-///
-pub fn stream_self_once() {
+pub fn main() {
+  let selector =
+    process.new_selector()
+    |> httpc.select_stream_messages(httpc.raw_stream_mapper())
+  
   let req =
     request.new()
     |> request.set_method(Get)
     |> request.set_host("postman-echo.com")
+    // stream 1 chunk
     |> request.set_path("/stream/1")
 
-  // Send the streaming request to the server
-  let assert Ok(request_id) = httpc.send_stream_request(req)
-  
-  // Configure the selector
-  let selector = process.new_selector() |> httpc.select_stream_messages(httpc.raw_stream_mapper())
+  let assert Ok(streamer) =
+     actor.new_with_initialiser(100, fn(_) {
+         let assert Ok(_request_id) =
+            httpc.dispatch_stream_request(httpc.configure(), req)
 
-  let assert Ok(httpc.StreamStart(_request_id_, _headers, handler_pid)) =
-    process.selector_receive(selector, 1000)
+         Ok(
+            actor.initialised(process.self())
+            |> actor.selecting(selector)
+         )
+     })
+     |> actor.on_message(handle_stream_message)
+     |> actor.start
 
-  let _nil = httpc.receive_next_stream_message(handler_pid)
-  let assert Ok(httpc.StreamChunk(_request_id_, _binary_part)) =
-    process.selector_receive(selector, 1000)
+  // We unlink streamer actor with main, to avoid crashing main
+  // in the case our streamer crashes. 
+  process.unlink(streamer.pid)
 
-  let _nil = httpc.receive_next_stream_message(handler_pid)
-  let assert Ok(httpc.StreamEnd(_request_id_, _headers)) =
-    process.selector_receive(selector, 1000)
+  // Trigger the stream messages letting the streamer actor handle them.
+  process.selector_receive(selector, 10)
 }
-}
+
+ fn handle_stream_message(
+   stream_pid: Pid,
+   message: StreamMessage,
+   ) -> actor.Next(Pid, StreamMessage) {
+   case message {
+      httpc.StreamStart(_request_id, _headers, stream_pid) -> {
+         httpc.receive_next_stream_message(stream_pid)
+         actor.continue(stream_pid)
+      }
+      httpc.StreamChunk(_request_id, _chunk) -> {
+         // Process the chunk here (write to file, parse, etc.)
+         httpc.receive_next_stream_message(stream_pid)
+         actor.continue(stream_pid)
+      }
+      httpc.StreamEnd(_request_id, _headers) -> {
+         actor.stop()
+      }
+      httpc.StreamError(_request_id, _error) -> {
+         actor.stop_abnormal("Http error")
+      }
+  }
+} 
 ```
 
 ## Use with Erlang/OTP versions older than 26.0
